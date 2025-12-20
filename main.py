@@ -4,6 +4,7 @@ import torch.nn as nn
 import torch
 from typing import List
 from torch.optim import Adam
+from torch.utils.data import DataLoader, Dataset
 from torch.distributions.normal import Normal
 from torch.distributions import Distribution
 from torch.nn.functional import mse_loss
@@ -25,7 +26,7 @@ class Critic(nn.Module):
         if states.ndim == 1:
             states = states[None]
 
-        return self._critic(torch.Tensor(states))
+        return self._critic(torch.Tensor(states))[..., 0]
 
 
 class Actor(nn.Module):
@@ -56,42 +57,47 @@ class Actor(nn.Module):
 
 @dataclass
 class Rollout:
-    states: List[np.ndarray] = field(default_factory=list)
-    actions: List[np.ndarray] = field(default_factory=list)
-    log_probs: List[np.ndarray] = field(default_factory=list)
-    rewards: List[float] = field(default_factory=list)
+    states: torch.Tensor
+    actions: torch.Tensor
+    log_probs: torch.Tensor
+    rewards: torch.Tensor
+    returns: torch.Tensor
+    advantages: torch.Tensor
 
 
-def collect_rollout(env: gymnasium.Env, actor: Actor) -> Rollout:
+def collect_sars(env: gymnasium.Env, actor: Actor):
     terminal, truncated = False, False
     state, _ = env.reset()
-    rollout = Rollout(states=[state])
+
+    states: List[np.ndarray] = [state]
+    actions: List[np.ndarray] = []
+    rewards: List[float] = []
 
     while not (terminal or truncated):
         with torch.inference_mode():
-            action_dist = actor.get_action_distribution(rollout.states[-1])
+            action_dist = actor.get_action_distribution(states[-1])
             action = action_dist.sample()
-            log_prob = action_dist.log_prob(action)
             action = action.numpy().squeeze()
 
             state, reward, truncated, terminal, _ = env.step(action)
 
-            rollout.states.append(state)
-            rollout.actions.append(action)
-            rollout.rewards.append(reward)
-            rollout.log_probs.append(log_prob)
+            states.append(state)
+            actions.append(action)
+            rewards.append(reward)
 
-    return rollout
+    return torch.Tensor(states), torch.Tensor(actions), torch.Tensor(rewards)
 
 
-def compute_gae(
-    rollout: Rollout, critic: Critic, lamb: float, gamma: float
+def compute_advantage(
+    states: torch.Tensor,
+    rewards: torch.Tensor,
+    critic: Critic,
+    lamb: float,
+    gamma: float,
 ) -> torch.Tensor:
     with torch.inference_mode():
-        values = critic.get_value(np.stack(rollout.states))
-        td_error = (
-            torch.Tensor(rollout.rewards)[:, None] + gamma * values[1:] - values[:-1]
-        )
+        values = critic.get_value(states)
+        td_error = rewards + gamma * values[1:] - values[:-1]
 
         advantage = torch.zeros_like(values)
 
@@ -101,57 +107,91 @@ def compute_gae(
         return advantage[:-1]
 
 
-def compute_returns(rollout: Rollout, gamma: float) -> torch.Tensor:
+def compute_returns(rewards: torch.Tensor, gamma: float) -> torch.Tensor:
     with torch.inference_mode():
-        returns = torch.zeros(len(rollout.rewards) + 1)
+        returns = torch.zeros(len(rewards) + 1)
 
-        for t in reversed(range(len(rollout.rewards))):
-            returns[t] = rollout.rewards[t] + gamma * returns[t + 1]
+        for t in reversed(range(len(rewards))):
+            returns[t] = rewards[t] + gamma * returns[t + 1]
 
         return returns[:-1]
 
 
-class RolloutDataLoader(torch.utils.data.DataLoader):
+def collect_rollout(
+    env: gymnasium.Env,
+    actor: Actor,
+    critic: Critic,
+    LAMBDA: float = 0.95,
+    GAMMA: float = 0.99,
+) -> Rollout:
+    states, actions, rewards = collect_sars(env, actor)
+    log_probs = actor.get_action_distribution(states[:-1]).log_prob(actions)
+    advantages = compute_advantage(states, rewards, critic, LAMBDA, GAMMA)
+    returns = compute_returns(rewards, GAMMA)
+
+    return Rollout(states[:-1], actions, log_probs, rewards, advantages, returns)
+
+
+class RolloutDataset(Dataset):
     def __init__(self, rollouts: List[Rollout]):
-        pass
+        self.states = torch.vstack([r.states for r in rollouts])
+        self.actions = torch.vstack([r.actions for r in rollouts])
+        self.log_probs = torch.vstack([r.log_probs for r in rollouts])
+        self.advantages = torch.hstack([r.advantages for r in rollouts])
+        self.returns = torch.hstack([r.returns for r in rollouts])
+
+    def __len__(self):
+        return len(self.advantages)
+
+    def __getitem__(self, idx):
+        return (
+            self.states[idx],
+            self.actions[idx],
+            self.log_probs[idx],
+            self.advantages[idx],
+            self.returns[idx],
+        )
 
 
 def main() -> None:
     EPSILON = 0.1
-    LAMBDA = 0.95
-    GAMMA = 0.99
-    EPOCHS = 10
-    K_critic = 0.1
-    K_entropy = 0.2
+    N_EPOCHS = 10
+    N_ROLLOUTS = 3
+    K_CRITIC = 0.1
+    K_ENTROPY = 0.2
 
     env = gymnasium.make("BipedalWalker-v3", render_mode="rgb_array")
 
     actor = Actor(env)
     critic = Critic(env)
-
     optimizer = Adam(list(actor.parameters()) + list(critic.parameters()), lr=3e-4)
 
-    rollout = collect_rollout(env, actor, critic)
-    advantage = compute_gae(rollout, critic, LAMBDA, GAMMA)
-    returns = compute_returns(rollout, GAMMA)
+    dataset = RolloutDataset(
+        [collect_rollout(env, actor, critic) for _ in range(N_ROLLOUTS)]
+    )
 
-    for _ in range(EPOCHS):
+    for _ in range(N_EPOCHS):
+        for states, actions, log_probs, advantage, returns in DataLoader(
+            dataset, batch_size=32
+        ):
 
-        action_dist = actor.get_action_distribution(rollout.states)
-        values = critic.get_value(rollout.states)
+            action_dist = actor.get_action_distribution(states)
+            values = critic.get_value(states)
 
-        ratio = torch.exp(action_dist.log_prob(rollout.actions) - rollout.log_probs)
-        clipped_ratio = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
+            ratio = torch.exp(action_dist.log_prob(actions) - log_probs)
+            clipped_ratio = torch.clamp(ratio, 1 - EPSILON, 1 + EPSILON)
 
-        loss_clip = -torch.min(ratio * advantage, clipped_ratio * advantage)
-        loss_entropy = -action_dist.entropy().mean()
-        loss_critic = mse_loss(values, returns)
+            loss_clip = -torch.min(
+                ratio * advantage[:, None], clipped_ratio * advantage[:, None]
+            )
+            loss_entropy = -action_dist.entropy().mean()
+            loss_critic = mse_loss(values, returns)
 
-        loss = loss_clip + K_entropy * loss_entropy + K_critic * loss_critic
+            loss = loss_clip + K_ENTROPY * loss_entropy + K_CRITIC * loss_critic
 
-        optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
 
 
 if __name__ == "__main__":
