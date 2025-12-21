@@ -38,39 +38,6 @@ def parse_args():
         default=2000000,
         help="total timesteps of the experiments",
     )
-    parser.add_argument(
-        "--torch-deterministic",
-        action="store_true",
-        help="if toggled, `torch.backends.cudnn.deterministic=False`",
-    )
-    parser.add_argument(
-        "--cuda",
-        action="store_true",
-        help="if toggled, cuda will be enabled by default",
-    )
-    parser.add_argument(
-        "--track",
-        action="store_true",
-        help="if toggled, this experiment will be tracked with Weights and Biases",
-    )
-    parser.add_argument(
-        "--wandb-project-name",
-        type=str,
-        default="ppo-implementation-details",
-        help="the wandb's project name",
-    )
-    parser.add_argument(
-        "--wandb-entity",
-        type=str,
-        default=None,
-        help="the entity (team) of wandb's project",
-    )
-    parser.add_argument(
-        "--capture-video",
-        action="store_true",
-        help="whether to capture videos of the agent performances (check out `videos` folder)",
-    )
-
     # Algorithm specific arguments
     parser.add_argument(
         "--num-envs",
@@ -83,11 +50,6 @@ def parse_args():
         type=int,
         default=2048,
         help="the number of steps to run in each environment per policy rollout",
-    )
-    parser.add_argument(
-        "--anneal-lr",
-        action="store_true",
-        help="Toggle learning rate annealing for policy and value networks",
     )
     parser.add_argument(
         "--gamma", type=float, default=0.99, help="the discount factor gamma"
@@ -108,20 +70,10 @@ def parse_args():
         help="the K epochs to update the policy",
     )
     parser.add_argument(
-        "--norm-adv",
-        action="store_true",
-        help="Toggles advantages normalization",
-    )
-    parser.add_argument(
         "--clip-coef",
         type=float,
         default=0.2,
         help="the surrogate clipping coefficient",
-    )
-    parser.add_argument(
-        "--clip-vloss",
-        action="store_true",
-        help="Toggles whether or not to use a clipped loss for the value function, as per the paper.",
     )
     parser.add_argument(
         "--ent-coef", type=float, default=0.0, help="coefficient of the entropy"
@@ -144,18 +96,20 @@ def parse_args():
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
-    # fmt: on
     return args
 
 
-def make_env(gym_id, seed, idx, capture_video, run_name):
+def make_env(gym_id, seed, idx, run_name):
     def thunk():
-        env = gym.make(gym_id)
-        # env.seed(seed)
+        env = gym.make(gym_id, render_mode="rgb_array")
+
+        assert isinstance(
+            env.action_space, gym.spaces.Box
+        ), "only continuous action space is supported"
+
         env = gym.wrappers.RecordEpisodeStatistics(env)
-        if capture_video:
-            if idx == 0:
-                env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
+        if idx == 0:
+            env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(
@@ -165,6 +119,7 @@ def make_env(gym_id, seed, idx, capture_video, run_name):
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         env.action_space.seed(seed)
         env.observation_space.seed(seed)
+        # env.seed(seed)
         return env
 
     return thunk
@@ -224,18 +179,6 @@ class Agent(nn.Module):
 if __name__ == "__main__":
     args = parse_args()
     run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    if args.track:
-        import wandb
-
-        wandb.init(
-            project=args.wandb_project_name,
-            entity=args.wandb_entity,
-            sync_tensorboard=True,
-            config=vars(args),
-            name=run_name,
-            monitor_gym=True,
-            save_code=True,
-        )
     writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
@@ -247,20 +190,17 @@ if __name__ == "__main__":
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
-    torch.backends.cudnn.deterministic = args.torch_deterministic
+    torch.backends.cudnn.deterministic = True
 
-    device = torch.device("cuda" if torch.cuda.is_available() and args.cuda else "cpu")
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # env setup
     envs = gym.vector.SyncVectorEnv(
         [
-            make_env(args.gym_id, args.seed + i, i, args.capture_video, run_name)
+            make_env(args.gym_id, args.seed + i, i, run_name)
             for i in range(args.num_envs)
         ]
     )
-    assert isinstance(
-        envs.single_action_space, gym.spaces.Box
-    ), "only continuous action space is supported"
 
     agent = Agent(envs).to(device)
     optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
@@ -284,15 +224,14 @@ if __name__ == "__main__":
     next_done = torch.zeros(args.num_envs).to(device)
     num_updates = args.total_timesteps // args.batch_size
 
-    for update in range(1, num_updates + 1):
+    for update in range(num_updates):
         # Annealing the rate if instructed to do so.
-        if args.anneal_lr:
-            frac = 1.0 - (update - 1.0) / num_updates
-            lrnow = frac * args.learning_rate
-            optimizer.param_groups[0]["lr"] = lrnow
+        frac = 1.0 - update / num_updates
+        lrnow = frac * args.learning_rate
+        optimizer.param_groups[0]["lr"] = lrnow
 
-        for step in range(0, args.num_steps):
-            global_step += 1 * args.num_envs
+        for step in range(args.num_steps):
+            global_step += args.num_envs
             obs[step] = next_obs
             dones[step] = next_done
 
@@ -311,9 +250,6 @@ if __name__ == "__main__":
             ).to(device)
 
             if "episode" in info:
-                print(
-                    f"global_step={global_step}, episodic_return={info["episode"]["r"].mean()}"
-                )
                 writer.add_scalar(
                     "charts/episodic_return", info["episode"]["r"].mean(), global_step
                 )
@@ -323,6 +259,7 @@ if __name__ == "__main__":
 
         # bootstrap value if not done
         with torch.no_grad():
+            values_ = agent.get_value(obs).reshape(1, -1)
             next_value = agent.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
@@ -373,10 +310,9 @@ if __name__ == "__main__":
                     ]
 
                 mb_advantages = b_advantages[mb_inds]
-                if args.norm_adv:
-                    mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                        mb_advantages.std() + 1e-8
-                    )
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (
+                    mb_advantages.std() + 1e-8
+                )
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
