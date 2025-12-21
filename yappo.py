@@ -51,17 +51,19 @@ def parse_args():
         default=2048,
         help="the number of steps to run in each environment per policy rollout",
     )
-    parser.add_argument(
-        "--gamma", type=float, default=0.99, help="the discount factor gamma"
-    )
+    parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
     parser.add_argument(
         "--gae-lambda",
         type=float,
         default=0.95,
         help="the lambda for the general advantage estimation",
     )
+    parser.add_argument("--num-minibatches", type=int, default=32, help="the number of mini-batches")
     parser.add_argument(
-        "--num-minibatches", type=int, default=32, help="the number of mini-batches"
+        "--update-epochs",
+        type=int,
+        default=10,
+        help="the K epochs to update the policy",
     )
     parser.add_argument(
         "--clip-coef",
@@ -69,12 +71,8 @@ def parse_args():
         default=0.2,
         help="the surrogate clipping coefficient",
     )
-    parser.add_argument(
-        "--ent-coef", type=float, default=0.0, help="coefficient of the entropy"
-    )
-    parser.add_argument(
-        "--vf-coef", type=float, default=0.5, help="coefficient of the value function"
-    )
+    parser.add_argument("--ent-coef", type=float, default=0.0, help="coefficient of the entropy")
+    parser.add_argument("--vf-coef", type=float, default=0.5, help="coefficient of the value function")
     parser.add_argument(
         "--max-grad-norm",
         type=float,
@@ -97,18 +95,14 @@ def make_env(gym_id, seed, idx, run_name):
     def thunk():
         env = gym.make(gym_id, render_mode="rgb_array")
 
-        assert isinstance(
-            env.action_space, gym.spaces.Box
-        ), "only continuous action space is supported"
+        assert isinstance(env.action_space, gym.spaces.Box), "only continuous action space is supported"
 
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
         env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
-        env = gym.wrappers.TransformObservation(
-            env, lambda obs: np.clip(obs, -10, 10), env.observation_space
-        )
+        env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         env = gym.wrappers.NormalizeReward(env)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
         env.action_space.seed(seed)
@@ -129,9 +123,7 @@ class Critic(nn.Module):
     def __init__(self, env: gym.Env):
         super().__init__()
         self._critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(env.single_observation_space.shape).prod(), 64)
-            ),
+            layer_init(nn.Linear(np.array(env.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
@@ -146,19 +138,13 @@ class Actor(nn.Module):
     def __init__(self, envs: gym.vector.SyncVectorEnv) -> None:
         super().__init__()
         self._mean = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
+            layer_init(nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)),
             nn.Tanh(),
             layer_init(nn.Linear(64, 64)),
             nn.Tanh(),
-            layer_init(
-                nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01
-            ),
+            layer_init(nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01),
         )
-        self._logstd = nn.Parameter(
-            torch.zeros(1, np.prod(envs.single_action_space.shape))
-        )
+        self._logstd = nn.Parameter(torch.zeros(1, np.prod(envs.single_action_space.shape)))
 
     def get_action_distribution(self, states: torch.Tensor | np.ndarray) -> Normal:
         mean = self._mean(states)
@@ -168,14 +154,43 @@ class Actor(nn.Module):
         return Normal(mean, std)
 
 
+def collect_rollout(envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int):
+    obs = torch.zeros((num_steps + 1, envs.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((num_steps, envs.num_envs) + envs.single_action_space.shape).to(device)
+    logprobs = torch.zeros((num_steps, envs.num_envs)).to(device)
+    rewards = torch.zeros((num_steps, envs.num_envs)).to(device)
+    dones = torch.zeros((num_steps + 1, envs.num_envs)).to(device)
+
+    for step in range(num_steps):
+        global_step += args.num_envs
+
+        with torch.no_grad():
+            dist = actor.get_action_distribution(obs[step])
+            actions[step] = dist.sample()
+            logprobs[step] = dist.log_prob(actions[step]).sum(1)
+
+        obs_, reward, done, _, info = envs.step(actions[step].cpu().numpy())
+
+        rewards[step] = torch.tensor(reward).to(device).view(-1)
+        obs[step + 1] = torch.Tensor(obs_).to(device)
+        dones[step + 1] = torch.Tensor(done).to(device)
+
+        if "episode" in info:
+            print(f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}")
+            writer.add_scalar("charts/episodic_return", info["episode"]["r"].mean(), global_step)
+            writer.add_scalar("charts/episodic_length", info["episode"]["l"].mean(), global_step)
+
+    return obs, actions, logprobs, rewards, dones
+
+
+global_step = 0
+writer = SummaryWriter(f"runs/{int(time.time())}")
+
 if __name__ == "__main__":
     args = parse_args()
-    run_name = f"{args.gym_id}__{args.exp_name}__{args.seed}__{int(time.time())}"
-    writer = SummaryWriter(f"runs/{run_name}")
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s"
-        % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
     # TRY NOT TO MODIFY: seeding
@@ -186,12 +201,7 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    envs = gym.vector.SyncVectorEnv(
-        [
-            make_env(args.gym_id, args.seed + i, i, run_name)
-            for i in range(args.num_envs)
-        ]
-    )
+    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, args.seed + i, i, run_name) for i in range(args.num_envs)])
 
     actor = Actor(envs).to(device)
     critic = Critic(envs).to(device)
@@ -202,21 +212,18 @@ if __name__ == "__main__":
     )
 
     # ALGO Logic: Storage setup
-    obs = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_observation_space.shape
-    ).to(device)
-    actions = torch.zeros(
-        (args.num_steps, args.num_envs) + envs.single_action_space.shape
-    ).to(device)
+    obs = torch.zeros((args.num_steps + 1, args.num_envs) + envs.single_observation_space.shape).to(device)
+    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
+    dones = torch.zeros((args.num_steps + 1, args.num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
-    global_step = 0
     start_time = time.time()
-    next_obs = torch.Tensor(envs.reset()[0]).to(device)
-    next_done = torch.zeros(args.num_envs).to(device)
+
+    obs[0] = torch.Tensor(envs.reset()[0]).to(device)
+    dones[0] = torch.zeros(args.num_envs).to(device)
+
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(num_updates):
@@ -226,64 +233,48 @@ if __name__ == "__main__":
 
         for step in range(args.num_steps):
             global_step += args.num_envs
-            obs[step] = next_obs
-            dones[step] = next_done
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                dist = actor.get_action_distribution(next_obs)
+                dist = actor.get_action_distribution(obs[step])
                 actions[step] = dist.sample()
                 logprobs[step] = dist.log_prob(actions[step]).sum(1)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, truncated, info = envs.step(
-                actions[step].cpu().numpy()
-            )
+            obs_, reward, done, truncated, info = envs.step(actions[step].cpu().numpy())
+
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs = torch.Tensor(next_obs).to(device)
-            next_done = torch.Tensor(done).to(device)
+            obs[step + 1] = torch.Tensor(obs_).to(device)
+            dones[step + 1] = torch.Tensor(done).to(device)
 
             if "episode" in info:
-                print(
-                    f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}"
-                )
-                writer.add_scalar(
-                    "charts/episodic_return", info["episode"]["r"].mean(), global_step
-                )
-                writer.add_scalar(
-                    "charts/episodic_length", info["episode"]["l"].mean(), global_step
-                )
+                print(f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}")
+                writer.add_scalar("charts/episodic_return", info["episode"]["r"].mean(), global_step)
+                writer.add_scalar("charts/episodic_length", info["episode"]["l"].mean(), global_step)
 
         with torch.no_grad():
             values = critic.get_value(obs).squeeze()
 
         # bootstrap value if not done
         with torch.no_grad():
-            next_value = critic.get_value(next_obs).reshape(1, -1)
-            advantages = torch.zeros_like(rewards).to(device)
+            advantages = torch.zeros_like(values).to(device)
+            advantages[-1] = 0
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
-                if t == args.num_steps - 1:
-                    nextnonterminal = 1.0 - next_done
-                    nextvalues = next_value
-                else:
-                    nextnonterminal = 1.0 - dones[t + 1]
-                    nextvalues = values[t + 1]
-                delta = (
-                    rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                )
-                advantages[t] = lastgaelam = (
-                    delta + args.gamma * args.gae_lambda * nextnonterminal * lastgaelam
-                )
+                nextnonterminal = 1.0 - dones[t + 1]
+                nextvalues = values[t + 1]
+                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
+                advantages[t] = delta + args.gamma * args.gae_lambda * nextnonterminal * advantages[t + 1]
+
             returns = advantages + values
 
         # flatten the batch
-        b_obs = obs.reshape((-1,) + envs.single_observation_space.shape)
+        b_obs = obs[:-1].reshape((-1,) + envs.single_observation_space.shape)
         b_logprobs = logprobs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages.reshape(-1)
-        b_returns = returns.reshape(-1)
-        b_values = values.reshape(-1)
+        b_advantages = advantages[:-1].reshape(-1)
+        b_returns = returns[:-1].reshape(-1)
+        b_values = values[:-1].reshape(-1)
 
         # Optimizing the policy and value network
         b_inds = np.arange(args.batch_size)
@@ -306,20 +297,14 @@ if __name__ == "__main__":
                     # calculate approx_kl http://joschu.net/blog/kl-approx.html
                     old_approx_kl = (-logratio).mean()
                     approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [
-                        ((ratio - 1.0).abs() > args.clip_coef).float().mean().item()
-                    ]
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
                 mb_advantages = b_advantages[mb_inds]
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (
-                    mb_advantages.std() + 1e-8
-                )
+                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
                 pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(
-                    ratio, 1 - args.clip_coef, 1 + args.clip_coef
-                )
+                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
@@ -346,9 +331,7 @@ if __name__ == "__main__":
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
         # TRY NOT TO MODIFY: record rewards for plotting purposes
-        writer.add_scalar(
-            "charts/learning_rate", optimizer.param_groups[0]["lr"], global_step
-        )
+        writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
         writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
         writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
@@ -356,9 +339,7 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        writer.add_scalar(
-            "charts/SPS", int(global_step / (time.time() - start_time)), global_step
-        )
+        writer.add_scalar("charts/SPS", int(global_step / (time.time() - start_time)), global_step)
 
     envs.close()
     writer.close()
