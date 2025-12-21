@@ -103,26 +103,18 @@ class Actor(nn.Module):
 
 
 class RolloutDataset(Dataset):
-    def __init__(self, envs, states, actions, log_probs, advantages, returns, values):
-        self.states = states[:-1].reshape((-1,) + envs.single_observation_space.shape)
-        self.actions = actions.reshape((-1,) + envs.single_action_space.shape)
+    def __init__(self, states, actions, log_probs, advantages, returns):
+        self.states = states[:-1].reshape(-1, states.shape[2])
+        self.actions = actions.reshape(-1, actions.shape[2])
         self.log_probs = log_probs.reshape(-1)
         self.advantages = advantages[:-1].reshape(-1)
         self.returns = returns[:-1].reshape(-1)
-        self.values = values[:-1].reshape(-1)
 
     def __len__(self):
         return len(self.actions)
 
     def __getitem__(self, idx):
-        return (
-            self.states[idx],
-            self.actions[idx],
-            self.log_probs[idx],
-            self.advantages[idx],
-            self.returns[idx],
-            self.values[idx],
-        )
+        return (self.states[idx], self.actions[idx], self.log_probs[idx], self.advantages[idx], self.returns[idx])
 
 
 def collect_rollout(envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int):
@@ -174,7 +166,6 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    # TRY NOT TO MODIFY: seeding
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -194,9 +185,7 @@ if __name__ == "__main__":
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(num_updates):
-        # Annealing the learning rate
-        lr = (1.0 - update / num_updates) * args.learning_rate
-        optimizer.param_groups[0]["lr"] = lr
+        optimizer.param_groups[0]["lr"] = (1.0 - update / num_updates) * args.learning_rate
 
         states, actions, log_probs, rewards, dones = collect_rollout(envs, actor, args.num_steps)
 
@@ -207,32 +196,21 @@ if __name__ == "__main__":
 
         returns = advantages + values
 
-        ds = RolloutDataset(envs, states, actions, log_probs, advantages, returns, values)
-        loader = DataLoader(ds, args.minibatch_size)
-
-        # flatten the batch
-        b_states = states[:-1].reshape((-1,) + envs.single_observation_space.shape)
-        b_log_probs = log_probs.reshape(-1)
-        b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
-        b_advantages = advantages[:-1].reshape(-1)
-        b_returns = returns[:-1].reshape(-1)
-        b_values = values[:-1].reshape(-1)
+        ds = RolloutDataset(states, actions, log_probs, advantages, returns)
+        loader = DataLoader(ds, args.minibatch_size, shuffle=True)
 
         # Optimizing the policy and value network
-        b_inds = np.arange(args.batch_size)
         clipfracs = []
+
         for epoch in range(args.update_epochs):
-            np.random.shuffle(b_inds)
-            for start in range(0, args.batch_size, args.minibatch_size):
-                end = start + args.minibatch_size
-                mb_inds = b_inds[start:end]
+            for b_states, b_actions, b_log_probs, b_advantages, b_returns in loader:
 
-                action_dist = actor.get_action_distribution(b_states[mb_inds])
-                newlogprob = action_dist.log_prob(b_actions[mb_inds]).sum(1)
+                action_dist = actor.get_action_distribution(b_states)
+                newlogprob = action_dist.log_prob(b_actions).sum(1)
                 entropy = action_dist.entropy().sum(1)
-                newvalue = critic.get_value(b_states[mb_inds])
+                newvalue = critic.get_value(b_states)
 
-                logratio = newlogprob - b_log_probs[mb_inds]
+                logratio = newlogprob - b_log_probs
                 ratio = logratio.exp()
 
                 with torch.no_grad():
@@ -241,7 +219,7 @@ if __name__ == "__main__":
                     approx_kl = ((ratio - 1) - logratio).mean()
                     clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
-                mb_advantages = b_advantages[mb_inds]
+                mb_advantages = b_advantages
                 mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
 
                 # Policy loss
@@ -250,25 +228,22 @@ if __name__ == "__main__":
                 pg_loss = torch.max(pg_loss1, pg_loss2).mean()
 
                 # Value loss
-                newvalue = newvalue.view(-1)
-                v_loss = 0.5 * ((newvalue - b_returns[mb_inds]) ** 2).mean()
+                v_loss = 0.5 * ((newvalue - b_returns) ** 2).mean()
 
                 entropy_loss = entropy.mean()
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(actor.parameters()) + list(critic.parameters()),
-                    args.max_grad_norm,
-                )
+                nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad_norm)
                 optimizer.step()
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
                     break
 
-        y_pred, y_true = b_values.cpu().numpy(), b_returns.cpu().numpy()
+        y_pred = values.reshape(-1).cpu().numpy()
+        y_true = returns.reshape(-1).cpu().numpy()
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
