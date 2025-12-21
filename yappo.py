@@ -167,63 +167,11 @@ class Actor(nn.Module):
         )
 
     def get_action_distribution(self, states: torch.Tensor | np.ndarray) -> Normal:
-        mean = self._mean(torch.Tensor(states))
+        mean = self._mean(states)
         logstd = self._logstd.expand_as(mean)
         std = torch.exp(logstd)
 
         return Normal(mean, std)
-
-
-class Agent(nn.Module):
-    def __init__(self, envs):
-        super(Agent, self).__init__()
-        self.critic = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 1), std=1.0),
-        )
-        self.actor_mean = nn.Sequential(
-            layer_init(
-                nn.Linear(np.array(envs.single_observation_space.shape).prod(), 64)
-            ),
-            nn.Tanh(),
-            layer_init(nn.Linear(64, 64)),
-            nn.Tanh(),
-            layer_init(
-                nn.Linear(64, np.prod(envs.single_action_space.shape)), std=0.01
-            ),
-        )
-        self.actor_logstd = nn.Parameter(
-            torch.zeros(1, np.prod(envs.single_action_space.shape))
-        )
-
-    def get_value(self, x):
-        return self.critic(x)
-
-    def get_action_distribution(self, states: torch.Tensor) -> Normal:
-        mean = self.actor_mean(states)
-        logstd = self.actor_logstd.expand_as(mean)
-        std = torch.exp(logstd)
-
-        return Normal(mean, std)
-
-    def get_action_and_value(self, x, action=None):
-        action_mean = self.actor_mean(x)
-        action_logstd = self.actor_logstd.expand_as(action_mean)
-        action_std = torch.exp(action_logstd)
-        probs = Normal(action_mean, action_std)
-        if action is None:
-            action = probs.sample()
-        return (
-            action,
-            probs.log_prob(action).sum(1),
-            probs.entropy().sum(1),
-            self.critic(x),
-        )
 
 
 if __name__ == "__main__":
@@ -254,8 +202,11 @@ if __name__ == "__main__":
 
     actor = Actor(envs).to(device)
     critic = Critic(envs).to(device)
-    agent = Agent(envs).to(device)
-    optimizer = optim.Adam(agent.parameters(), lr=args.learning_rate, eps=1e-5)
+    optimizer = optim.Adam(
+        list(actor.parameters()) + list(critic.parameters()),
+        lr=args.learning_rate,
+        eps=1e-5,
+    )
 
     # ALGO Logic: Storage setup
     obs = torch.zeros(
@@ -267,7 +218,6 @@ if __name__ == "__main__":
     logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
     rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
     dones = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    values = torch.zeros((args.num_steps, args.num_envs)).to(device)
 
     # TRY NOT TO MODIFY: start the game
     global_step = 0
@@ -289,8 +239,10 @@ if __name__ == "__main__":
 
             # ALGO LOGIC: action logic
             with torch.no_grad():
-                action, logprob, _, value = agent.get_action_and_value(next_obs)
-                values[step] = value.flatten()
+                dist = actor.get_action_distribution(next_obs)
+                action = dist.sample()
+                logprob = dist.log_prob(action).sum(1)
+
             actions[step] = action
             logprobs[step] = logprob
 
@@ -302,6 +254,9 @@ if __name__ == "__main__":
             ).to(device)
 
             if "episode" in info:
+                print(
+                    f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}"
+                )
                 writer.add_scalar(
                     "charts/episodic_return", info["episode"]["r"].mean(), global_step
                 )
@@ -309,10 +264,12 @@ if __name__ == "__main__":
                     "charts/episodic_length", info["episode"]["l"].mean(), global_step
                 )
 
+        with torch.no_grad():
+            values = critic.get_value(obs).squeeze()
+
         # bootstrap value if not done
         with torch.no_grad():
-            values_ = agent.get_value(obs).reshape(1, -1)
-            next_value = agent.get_value(next_obs).reshape(1, -1)
+            next_value = critic.get_value(next_obs).reshape(1, -1)
             advantages = torch.zeros_like(rewards).to(device)
             lastgaelam = 0
             for t in reversed(range(args.num_steps)):
@@ -347,9 +304,11 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                _, newlogprob, entropy, newvalue = agent.get_action_and_value(
-                    b_obs[mb_inds], b_actions[mb_inds]
-                )
+                action_dist = actor.get_action_distribution(b_obs[mb_inds])
+                newlogprob = action_dist.log_prob(b_actions[mb_inds]).sum(1)
+                entropy = action_dist.entropy().sum(1)
+                newvalue = critic.get_value(b_obs[mb_inds])
+
                 logratio = newlogprob - b_logprobs[mb_inds]
                 ratio = logratio.exp()
 
@@ -382,7 +341,10 @@ if __name__ == "__main__":
 
                 optimizer.zero_grad()
                 loss.backward()
-                nn.utils.clip_grad_norm_(agent.parameters(), args.max_grad_norm)
+                nn.utils.clip_grad_norm_(
+                    list(actor.parameters()) + list(critic.parameters()),
+                    args.max_grad_norm,
+                )
                 optimizer.step()
 
             if args.target_kl is not None:
@@ -404,7 +366,6 @@ if __name__ == "__main__":
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
         writer.add_scalar("losses/clipfrac", np.mean(clipfracs), global_step)
         writer.add_scalar("losses/explained_variance", explained_var, global_step)
-        print("SPS:", int(global_step / (time.time() - start_time)))
         writer.add_scalar(
             "charts/SPS", int(global_step / (time.time() - start_time)), global_step
         )
