@@ -64,12 +64,6 @@ def parse_args():
         "--num-minibatches", type=int, default=32, help="the number of mini-batches"
     )
     parser.add_argument(
-        "--update-epochs",
-        type=int,
-        default=10,
-        help="the K epochs to update the policy",
-    )
-    parser.add_argument(
         "--clip-coef",
         type=float,
         default=0.2,
@@ -192,7 +186,6 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # env setup
     envs = gym.vector.SyncVectorEnv(
         [
             make_env(args.gym_id, args.seed + i, i, run_name)
@@ -227,10 +220,9 @@ if __name__ == "__main__":
     num_updates = args.total_timesteps // args.batch_size
 
     for update in range(num_updates):
-        # Annealing the rate if instructed to do so.
-        frac = 1.0 - update / num_updates
-        lrnow = frac * args.learning_rate
-        optimizer.param_groups[0]["lr"] = lrnow
+        # Annealing the learning rate
+        lr = (1.0 - update / num_updates) * args.learning_rate
+        optimizer.param_groups[0]["lr"] = lr
 
         for step in range(args.num_steps):
             global_step += args.num_envs
@@ -240,18 +232,16 @@ if __name__ == "__main__":
             # ALGO LOGIC: action logic
             with torch.no_grad():
                 dist = actor.get_action_distribution(next_obs)
-                action = dist.sample()
-                logprob = dist.log_prob(action).sum(1)
-
-            actions[step] = action
-            logprobs[step] = logprob
+                actions[step] = dist.sample()
+                logprobs[step] = dist.log_prob(actions[step]).sum(1)
 
             # TRY NOT TO MODIFY: execute the game and log data.
-            next_obs, reward, done, truncated, info = envs.step(action.cpu().numpy())
+            next_obs, reward, done, truncated, info = envs.step(
+                actions[step].cpu().numpy()
+            )
             rewards[step] = torch.tensor(reward).to(device).view(-1)
-            next_obs, next_done = torch.Tensor(next_obs).to(device), torch.Tensor(
-                done
-            ).to(device)
+            next_obs = torch.Tensor(next_obs).to(device)
+            next_done = torch.Tensor(done).to(device)
 
             if "episode" in info:
                 print(
