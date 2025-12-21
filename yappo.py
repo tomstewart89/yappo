@@ -7,84 +7,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import DataLoader, Dataset
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
+
+global_step = 0
+run_name = f"runs/{os.path.basename(__file__).rstrip(".py")}_{int(time.time())}"
+writer = SummaryWriter(run_name)
 
 
 def parse_args():
     parser = argparse.ArgumentParser()
-    parser.add_argument(
-        "--exp-name",
-        type=str,
-        default=os.path.basename(__file__).rstrip(".py"),
-        help="the name of this experiment",
-    )
-    parser.add_argument(
-        "--gym-id",
-        type=str,
-        default="BipedalWalker-v3",
-        help="the id of the gym environment",
-    )
-    parser.add_argument(
-        "--learning-rate",
-        type=float,
-        default=3e-4,
-        help="the learning rate of the optimizer",
-    )
+    parser.add_argument("--gym-id", type=str, default="BipedalWalker-v3", help="the id of the gym environment")
+    parser.add_argument("--learning-rate", type=float, default=3e-4, help="the learning rate of the optimizer")
     parser.add_argument("--seed", type=int, default=1, help="seed of the experiment")
-    parser.add_argument(
-        "--total-timesteps",
-        type=int,
-        default=2000000,
-        help="total timesteps of the experiments",
-    )
-    # Algorithm specific arguments
-    parser.add_argument(
-        "--num-envs",
-        type=int,
-        default=8,
-        help="the number of parallel game environments",
-    )
-    parser.add_argument(
-        "--num-steps",
-        type=int,
-        default=2048,
-        help="the number of steps to run in each environment per policy rollout",
-    )
+    parser.add_argument("--total-timesteps", type=int, default=2000000, help="total timesteps of the experiments")
+    parser.add_argument("--num-envs", type=int, default=8, help="the number of parallel game environments")
+    parser.add_argument("--num-steps", type=int, default=2048, help="the number of steps to run per rollout")
     parser.add_argument("--gamma", type=float, default=0.99, help="the discount factor gamma")
-    parser.add_argument(
-        "--gae-lambda",
-        type=float,
-        default=0.95,
-        help="the lambda for the general advantage estimation",
-    )
+    parser.add_argument("--gae-lambda", type=float, default=0.95, help="lambda for general advantage estimation")
     parser.add_argument("--num-minibatches", type=int, default=32, help="the number of mini-batches")
-    parser.add_argument(
-        "--update-epochs",
-        type=int,
-        default=10,
-        help="the K epochs to update the policy",
-    )
-    parser.add_argument(
-        "--clip-coef",
-        type=float,
-        default=0.2,
-        help="the surrogate clipping coefficient",
-    )
+    parser.add_argument("--update-epochs", type=int, default=10, help="the K epochs to update the policy")
+    parser.add_argument("--clip-coef", type=float, default=0.2, help="the surrogate clipping coefficient")
     parser.add_argument("--ent-coef", type=float, default=0.0, help="coefficient of the entropy")
     parser.add_argument("--vf-coef", type=float, default=0.5, help="coefficient of the value function")
-    parser.add_argument(
-        "--max-grad-norm",
-        type=float,
-        default=0.5,
-        help="the maximum norm for the gradient clipping",
-    )
-    parser.add_argument(
-        "--target-kl",
-        type=float,
-        default=None,
-        help="the target KL divergence threshold",
-    )
+    parser.add_argument("--max-grad-norm", type=float, default=0.5, help="the maximum norm for the gradient clipping")
+    parser.add_argument("--target-kl", type=float, default=None, help="the target KL divergence threshold")
     args = parser.parse_args()
     args.batch_size = int(args.num_envs * args.num_steps)
     args.minibatch_size = int(args.batch_size // args.num_minibatches)
@@ -154,37 +102,70 @@ class Actor(nn.Module):
         return Normal(mean, std)
 
 
+class RolloutDataset(Dataset):
+    def __init__(self, envs, states, actions, log_probs, advantages, returns, values):
+        self.states = states[:-1].reshape((-1,) + envs.single_observation_space.shape)
+        self.actions = actions.reshape((-1,) + envs.single_action_space.shape)
+        self.log_probs = log_probs.reshape(-1)
+        self.advantages = advantages[:-1].reshape(-1)
+        self.returns = returns[:-1].reshape(-1)
+        self.values = values[:-1].reshape(-1)
+
+    def __len__(self):
+        return len(self.actions)
+
+    def __getitem__(self, idx):
+        return (
+            self.states[idx],
+            self.actions[idx],
+            self.log_probs[idx],
+            self.advantages[idx],
+            self.returns[idx],
+            self.values[idx],
+        )
+
+
 def collect_rollout(envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int):
-    obs = torch.zeros((num_steps + 1, envs.num_envs) + envs.single_observation_space.shape).to(device)
+    states = torch.zeros((num_steps + 1, envs.num_envs) + envs.single_observation_space.shape).to(device)
     actions = torch.zeros((num_steps, envs.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((num_steps, envs.num_envs)).to(device)
+    log_probs = torch.zeros((num_steps, envs.num_envs)).to(device)
     rewards = torch.zeros((num_steps, envs.num_envs)).to(device)
     dones = torch.zeros((num_steps + 1, envs.num_envs)).to(device)
 
-    for step in range(num_steps):
-        global_step += args.num_envs
+    states[0] = torch.Tensor(envs._observations).to(device)
+
+    for t in range(num_steps):
+        global global_step
+        global_step += envs.num_envs
 
         with torch.no_grad():
-            dist = actor.get_action_distribution(obs[step])
-            actions[step] = dist.sample()
-            logprobs[step] = dist.log_prob(actions[step]).sum(1)
+            dist = actor.get_action_distribution(states[t])
+            actions[t] = dist.sample()
+            log_probs[t] = dist.log_prob(actions[t]).sum(1)
 
-        obs_, reward, done, _, info = envs.step(actions[step].cpu().numpy())
+        state, reward, done, _, info = envs.step(actions[t].cpu().numpy())
 
-        rewards[step] = torch.tensor(reward).to(device).view(-1)
-        obs[step + 1] = torch.Tensor(obs_).to(device)
-        dones[step + 1] = torch.Tensor(done).to(device)
+        rewards[t] = torch.tensor(reward).to(device).view(-1)
+        states[t + 1] = torch.Tensor(state).to(device)
+        dones[t + 1] = torch.Tensor(done).to(device)
 
         if "episode" in info:
             print(f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}")
             writer.add_scalar("charts/episodic_return", info["episode"]["r"].mean(), global_step)
             writer.add_scalar("charts/episodic_length", info["episode"]["l"].mean(), global_step)
 
-    return obs, actions, logprobs, rewards, dones
+    return states, actions, log_probs, rewards, dones
 
 
-global_step = 0
-writer = SummaryWriter(f"runs/{int(time.time())}")
+def compute_gae(values, dones, rewards, gamma, gae_lambda):
+    advantages = torch.zeros_like(values).to(device)
+
+    for t in reversed(range(len(rewards))):
+        delta = rewards[t] + gamma * values[t + 1] * (1.0 - dones[t + 1]) - values[t]
+        advantages[t] = delta + gamma * gae_lambda * (1.0 - dones[t + 1]) * advantages[t + 1]
+
+    return advantages
+
 
 if __name__ == "__main__":
     args = parse_args()
@@ -205,24 +186,10 @@ if __name__ == "__main__":
 
     actor = Actor(envs).to(device)
     critic = Critic(envs).to(device)
-    optimizer = optim.Adam(
-        list(actor.parameters()) + list(critic.parameters()),
-        lr=args.learning_rate,
-        eps=1e-5,
-    )
+    optimizer = optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=args.learning_rate, eps=1e-5)
 
-    # ALGO Logic: Storage setup
-    obs = torch.zeros((args.num_steps + 1, args.num_envs) + envs.single_observation_space.shape).to(device)
-    actions = torch.zeros((args.num_steps, args.num_envs) + envs.single_action_space.shape).to(device)
-    logprobs = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    rewards = torch.zeros((args.num_steps, args.num_envs)).to(device)
-    dones = torch.zeros((args.num_steps + 1, args.num_envs)).to(device)
-
-    # TRY NOT TO MODIFY: start the game
     start_time = time.time()
-
-    obs[0] = torch.Tensor(envs.reset()[0]).to(device)
-    dones[0] = torch.zeros(args.num_envs).to(device)
+    envs.reset()
 
     num_updates = args.total_timesteps // args.batch_size
 
@@ -231,46 +198,21 @@ if __name__ == "__main__":
         lr = (1.0 - update / num_updates) * args.learning_rate
         optimizer.param_groups[0]["lr"] = lr
 
-        for step in range(args.num_steps):
-            global_step += args.num_envs
-
-            # ALGO LOGIC: action logic
-            with torch.no_grad():
-                dist = actor.get_action_distribution(obs[step])
-                actions[step] = dist.sample()
-                logprobs[step] = dist.log_prob(actions[step]).sum(1)
-
-            # TRY NOT TO MODIFY: execute the game and log data.
-            obs_, reward, done, truncated, info = envs.step(actions[step].cpu().numpy())
-
-            rewards[step] = torch.tensor(reward).to(device).view(-1)
-            obs[step + 1] = torch.Tensor(obs_).to(device)
-            dones[step + 1] = torch.Tensor(done).to(device)
-
-            if "episode" in info:
-                print(f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}")
-                writer.add_scalar("charts/episodic_return", info["episode"]["r"].mean(), global_step)
-                writer.add_scalar("charts/episodic_length", info["episode"]["l"].mean(), global_step)
+        states, actions, log_probs, rewards, dones = collect_rollout(envs, actor, args.num_steps)
 
         with torch.no_grad():
-            values = critic.get_value(obs).squeeze()
+            values = critic.get_value(states).squeeze()
 
-        # bootstrap value if not done
-        with torch.no_grad():
-            advantages = torch.zeros_like(values).to(device)
-            advantages[-1] = 0
-            lastgaelam = 0
-            for t in reversed(range(args.num_steps)):
-                nextnonterminal = 1.0 - dones[t + 1]
-                nextvalues = values[t + 1]
-                delta = rewards[t] + args.gamma * nextvalues * nextnonterminal - values[t]
-                advantages[t] = delta + args.gamma * args.gae_lambda * nextnonterminal * advantages[t + 1]
+        advantages = compute_gae(values, dones, rewards, args.gamma, args.gae_lambda)
 
-            returns = advantages + values
+        returns = advantages + values
+
+        ds = RolloutDataset(envs, states, actions, log_probs, advantages, returns, values)
+        loader = DataLoader(ds, args.minibatch_size)
 
         # flatten the batch
-        b_obs = obs[:-1].reshape((-1,) + envs.single_observation_space.shape)
-        b_logprobs = logprobs.reshape(-1)
+        b_states = states[:-1].reshape((-1,) + envs.single_observation_space.shape)
+        b_log_probs = log_probs.reshape(-1)
         b_actions = actions.reshape((-1,) + envs.single_action_space.shape)
         b_advantages = advantages[:-1].reshape(-1)
         b_returns = returns[:-1].reshape(-1)
@@ -285,12 +227,12 @@ if __name__ == "__main__":
                 end = start + args.minibatch_size
                 mb_inds = b_inds[start:end]
 
-                action_dist = actor.get_action_distribution(b_obs[mb_inds])
+                action_dist = actor.get_action_distribution(b_states[mb_inds])
                 newlogprob = action_dist.log_prob(b_actions[mb_inds]).sum(1)
                 entropy = action_dist.entropy().sum(1)
-                newvalue = critic.get_value(b_obs[mb_inds])
+                newvalue = critic.get_value(b_states[mb_inds])
 
-                logratio = newlogprob - b_logprobs[mb_inds]
+                logratio = newlogprob - b_log_probs[mb_inds]
                 ratio = logratio.exp()
 
                 with torch.no_grad():
