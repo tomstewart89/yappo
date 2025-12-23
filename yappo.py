@@ -137,14 +137,14 @@ def collect_rollout(envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int
 
         state, reward, done, _, info = envs.step(actions[t].cpu().numpy())
 
-        rewards[t] = torch.tensor(reward).to(device).view(-1)
+        rewards[t] = torch.Tensor(reward).to(device).view(-1)
         states[t + 1] = torch.Tensor(state).to(device)
         dones[t + 1] = torch.Tensor(done).to(device)
 
         if "episode" in info:
-            print(f"global_step={global_step}, episodic_return={info['episode']['r'].mean()}")
-            writer.add_scalar("charts/episodic_return", info["episode"]["r"].mean(), global_step)
-            writer.add_scalar("charts/episodic_length", info["episode"]["l"].mean(), global_step)
+            print(f"global_step={global_step}, episodic_return={info["episode"]["r"][info["_episode"]].mean()}")
+            writer.add_scalar("charts/episodic_return", info["episode"]["r"][info["_episode"]].mean(), global_step)
+            writer.add_scalar("charts/episodic_length", info["episode"]["l"][info["_episode"]].mean(), global_step)
 
     return states, actions, log_probs, rewards, dones
 
