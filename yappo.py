@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
+from torch.nn.functional import mse_loss
 from torch.distributions.normal import Normal
 from torch.utils.tensorboard import SummaryWriter
 
@@ -29,8 +30,8 @@ def parse_args():
     parser.add_argument("--num-minibatches", type=int, default=32, help="the number of mini-batches")
     parser.add_argument("--update-epochs", type=int, default=10, help="the K epochs to update the policy")
     parser.add_argument("--clip-coef", type=float, default=0.2, help="the surrogate clipping coefficient")
-    parser.add_argument("--ent-coef", type=float, default=0.0, help="coefficient of the entropy")
-    parser.add_argument("--vf-coef", type=float, default=0.5, help="coefficient of the value function")
+    parser.add_argument("--entropy-coef", type=float, default=0.0, help="coefficient of the entropy")
+    parser.add_argument("--critic-coef", type=float, default=0.25, help="coefficient of the value function")
     parser.add_argument("--max-grad-norm", type=float, default=0.5, help="the maximum norm for the gradient clipping")
     parser.add_argument("--target-kl", type=float, default=None, help="the target KL divergence threshold")
     args = parser.parse_args()
@@ -39,7 +40,7 @@ def parse_args():
     return args
 
 
-def make_env(gym_id, seed, idx, run_name):
+def make_env(gym_id, idx, run_name):
     def thunk():
         env = gym.make(gym_id, render_mode="rgb_array")
 
@@ -53,9 +54,6 @@ def make_env(gym_id, seed, idx, run_name):
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         env = gym.wrappers.NormalizeReward(env)
         env = gym.wrappers.TransformReward(env, lambda reward: np.clip(reward, -10, 10))
-        env.action_space.seed(seed)
-        env.observation_space.seed(seed)
-        # env.seed(seed)
         return env
 
     return thunk
@@ -79,7 +77,7 @@ class Critic(nn.Module):
         )
 
     def get_value(self, states: torch.Tensor) -> torch.Tensor:
-        return self._critic(states)
+        return self._critic(states).squeeze()
 
 
 class Actor(nn.Module):
@@ -135,6 +133,8 @@ def collect_rollout(envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int
             actions[t] = dist.sample()
             log_probs[t] = dist.log_prob(actions[t]).sum(1)
 
+        # todo: clip actions
+
         state, reward, done, _, info = envs.step(actions[t].cpu().numpy())
 
         rewards[t] = torch.tensor(reward).to(device).view(-1)
@@ -173,14 +173,14 @@ if __name__ == "__main__":
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, args.seed + i, i, run_name) for i in range(args.num_envs)])
+    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, i, run_name) for i in range(args.num_envs)])
 
     actor = Actor(envs).to(device)
     critic = Critic(envs).to(device)
     optimizer = optim.Adam(list(actor.parameters()) + list(critic.parameters()), lr=args.learning_rate, eps=1e-5)
 
     start_time = time.time()
-    envs.reset()
+    envs.reset(seed=args.seed)
 
     num_updates = args.total_timesteps // args.batch_size
 
@@ -190,7 +190,7 @@ if __name__ == "__main__":
         states, actions, log_probs, rewards, dones = collect_rollout(envs, actor, args.num_steps)
 
         with torch.no_grad():
-            values = critic.get_value(states).squeeze()
+            values = critic.get_value(states)
 
         advantages = compute_gae(values, dones, rewards, args.gamma, args.gae_lambda)
 
@@ -199,44 +199,36 @@ if __name__ == "__main__":
         ds = RolloutDataset(states, actions, log_probs, advantages, returns)
         loader = DataLoader(ds, args.minibatch_size, shuffle=True)
 
-        # Optimizing the policy and value network
         clipfracs = []
 
         for epoch in range(args.update_epochs):
             for b_states, b_actions, b_log_probs, b_advantages, b_returns in loader:
 
                 action_dist = actor.get_action_distribution(b_states)
-                newlogprob = action_dist.log_prob(b_actions).sum(1)
                 entropy = action_dist.entropy().sum(1)
-                newvalue = critic.get_value(b_states)
 
-                logratio = newlogprob - b_log_probs
-                ratio = logratio.exp()
+                log_ratio = action_dist.log_prob(b_actions).sum(1) - b_log_probs
+                ratio = log_ratio.exp()
+                clipped_ratio = torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
 
-                with torch.no_grad():
-                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
-                    old_approx_kl = (-logratio).mean()
-                    approx_kl = ((ratio - 1) - logratio).mean()
-                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
+                norm_advantages = (b_advantages - b_advantages.mean()) / (b_advantages.std() + 1e-8)
 
-                mb_advantages = b_advantages
-                mb_advantages = (mb_advantages - mb_advantages.mean()) / (mb_advantages.std() + 1e-8)
-
-                # Policy loss
-                pg_loss1 = -mb_advantages * ratio
-                pg_loss2 = -mb_advantages * torch.clamp(ratio, 1 - args.clip_coef, 1 + args.clip_coef)
-                pg_loss = torch.max(pg_loss1, pg_loss2).mean()
-
-                # Value loss
-                v_loss = 0.5 * ((newvalue - b_returns) ** 2).mean()
-
+                policy_loss = -torch.min(norm_advantages * ratio, norm_advantages * clipped_ratio).mean()
+                critic_loss = mse_loss(critic.get_value(b_states), b_returns)
                 entropy_loss = entropy.mean()
-                loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
+
+                loss = policy_loss - args.entropy_coef * entropy_loss + critic_loss * args.critic_coef
 
                 optimizer.zero_grad()
                 loss.backward()
                 nn.utils.clip_grad_norm_(list(actor.parameters()) + list(critic.parameters()), args.max_grad_norm)
                 optimizer.step()
+
+                with torch.no_grad():
+                    # calculate approx_kl http://joschu.net/blog/kl-approx.html
+                    old_approx_kl = -log_ratio.mean()
+                    approx_kl = ((ratio - 1) - log_ratio).mean()
+                    clipfracs += [((ratio - 1.0).abs() > args.clip_coef).float().mean().item()]
 
             if args.target_kl is not None:
                 if approx_kl > args.target_kl:
@@ -247,10 +239,9 @@ if __name__ == "__main__":
         var_y = np.var(y_true)
         explained_var = np.nan if var_y == 0 else 1 - np.var(y_true - y_pred) / var_y
 
-        # TRY NOT TO MODIFY: record rewards for plotting purposes
         writer.add_scalar("charts/learning_rate", optimizer.param_groups[0]["lr"], global_step)
-        writer.add_scalar("losses/value_loss", v_loss.item(), global_step)
-        writer.add_scalar("losses/policy_loss", pg_loss.item(), global_step)
+        writer.add_scalar("losses/value_loss", critic_loss.item(), global_step)
+        writer.add_scalar("losses/policy_loss", policy_loss.item(), global_step)
         writer.add_scalar("losses/entropy", entropy_loss.item(), global_step)
         writer.add_scalar("losses/old_approx_kl", old_approx_kl.item(), global_step)
         writer.add_scalar("losses/approx_kl", approx_kl.item(), global_step)
