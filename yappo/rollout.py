@@ -18,7 +18,7 @@ def collect_rollout(
 ) -> Rollout:
     rollout = Rollout(envs, num_steps)
 
-    rollout.states[0] = torch.Tensor(envs.reset(seed=1)[0])
+    rollout.states[0] = torch.Tensor(envs.reset()[0])
 
     for t in range(num_steps):
         with torch.no_grad():

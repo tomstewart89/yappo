@@ -47,13 +47,14 @@ if __name__ == "__main__":
         "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
+    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, i, run_name) for i in range(args.num_envs)])
+    ppo = ProximalPolicyOptimizer(envs, PPOParams())
+
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
-
-    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, i, run_name) for i in range(args.num_envs)])
-    ppo = ProximalPolicyOptimizer(envs, PPOParams())
+    envs.reset(seed=args.seed)
 
     num_updates = args.total_timesteps // (args.num_envs * args.num_steps)  # todo: this
 
