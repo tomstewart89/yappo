@@ -1,5 +1,4 @@
 from typing import Callable
-import os
 import random
 import time
 import gymnasium as gym
@@ -13,8 +12,8 @@ from yappo.rollout import collect_rollout
 
 @dataclass
 class Params:
-    gym_id = "BipedalWalker-v3"
-    num_envs = 8
+    gym_id = "HumanoidStandup-v5"
+    num_envs = 16
     seed = 1
     learning_rate: float = 3e-4
     gamma: float = 0.99
@@ -25,7 +24,7 @@ class Params:
     max_grad_norm: float = 0.5
     minibatch_size: int = 512
     num_epochs: int = 10
-    total_timesteps: int = 2000000
+    total_timesteps: int = 10000000
     steps_per_rollout: int = 2048
 
 
@@ -52,7 +51,7 @@ if __name__ == "__main__":
     params = Params()
     global_step = 0
 
-    run_name = f"runs/{os.path.basename(__file__).rstrip('.py')}_{int(time.time())}"
+    run_name = f"runs/{params.gym_id}_{int(time.time())}"
     writer = SummaryWriter(run_name)
     writer.add_text(
         "hyperparameters",

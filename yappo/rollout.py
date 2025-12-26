@@ -21,7 +21,7 @@ def collect_rollout(
 ) -> Rollout:
 
     rollout = Rollout(envs, num_steps)
-    rollout.states[0] = torch.Tensor(envs.reset()[0])
+    rollout.states[0] = torch.Tensor(envs._observations)
 
     for t in range(num_steps):
         with torch.no_grad():
@@ -30,6 +30,7 @@ def collect_rollout(
             rollout.log_probs[t] = dist.log_prob(rollout.actions[t]).sum(1)
 
         # TODO: clip actions here
+        # torch.clip(rollout.actions[t], torch.Tensor(envs.action_space.low), torch.Tensor(envs.action_space.high))
 
         state, reward, done, _, info = envs.step(rollout.actions[t].cpu().numpy())
 
