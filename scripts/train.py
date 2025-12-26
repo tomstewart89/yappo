@@ -1,31 +1,33 @@
 from typing import Callable
+import argparse
 import random
 import time
 import gymnasium as gym
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
-from dataclasses import dataclass, asdict
 from yappo.ppo import ProximalPolicyOptimizer
 from yappo.rollout import collect_rollout
 
 
-@dataclass
-class Params:
-    gym_id = "HumanoidStandup-v5"
-    num_envs = 16
-    seed = 1
-    learning_rate: float = 3e-4
-    gamma: float = 0.99
-    lamb: float = 0.95
-    epsilon: float = 0.2
-    entropy_coef: float = 0.0
-    critic_coef: float = 0.25
-    max_grad_norm: float = 0.5
-    minibatch_size: int = 512
-    num_epochs: int = 10
-    total_timesteps: int = 10000000
-    steps_per_rollout: int = 2048
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--gym-id", type=str, default="BipedalWalker-v3")
+    parser.add_argument("--num-envs", type=int, default=16)
+    parser.add_argument("--seed", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=3e-4)
+    parser.add_argument("--num-steps", type=int, default=2048)
+    parser.add_argument("--gamma", type=float, default=0.99)
+    parser.add_argument("--lamb", type=float, default=0.95)
+    parser.add_argument("--epsilon", type=float, default=0.2)
+    parser.add_argument("--entropy-coef", type=float, default=0.0)
+    parser.add_argument("--critic-coef", type=float, default=0.25)
+    parser.add_argument("--max-grad-norm", type=float, default=0.5)
+    parser.add_argument("--minibatch-size", type=int, default=512)
+    parser.add_argument("--num-epochs", type=int, default=10)
+    parser.add_argument("--total-timesteps", type=int, default=2000000)
+    parser.add_argument("--steps-per-rollout", type=int, default=2048)
+    return parser.parse_args()
 
 
 def make_env(gym_id: str, idx: int, run_name: str) -> Callable:
@@ -37,7 +39,6 @@ def make_env(gym_id: str, idx: int, run_name: str) -> Callable:
         env = gym.wrappers.RecordEpisodeStatistics(env)
         if idx == 0:
             env = gym.wrappers.RecordVideo(env, f"videos/{run_name}")
-        env = gym.wrappers.ClipAction(env)
         env = gym.wrappers.NormalizeObservation(env)
         env = gym.wrappers.TransformObservation(env, lambda obs: np.clip(obs, -10, 10), env.observation_space)
         env = gym.wrappers.NormalizeReward(env)
@@ -48,23 +49,23 @@ def make_env(gym_id: str, idx: int, run_name: str) -> Callable:
 
 
 if __name__ == "__main__":
-    params = Params()
+    args = parse_args()
     global_step = 0
 
-    run_name = f"runs/{params.gym_id}_{int(time.time())}"
+    run_name = f"runs/{args.gym_id}_{int(time.time())}"
     writer = SummaryWriter(run_name)
     writer.add_text(
         "hyperparameters",
-        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in asdict(params).items()])),
+        "|param|value|\n|-|-|\n%s" % ("\n".join([f"|{key}|{value}|" for key, value in vars(args).items()])),
     )
 
-    envs = gym.vector.SyncVectorEnv([make_env(params.gym_id, i, run_name) for i in range(8)])
-    ppo = ProximalPolicyOptimizer(envs, **asdict(params))
+    envs = gym.vector.SyncVectorEnv([make_env(args.gym_id, i, run_name) for i in range(8)])
+    ppo = ProximalPolicyOptimizer(envs, **vars(args))
 
-    envs.reset(seed=params.seed)
-    random.seed(params.seed)
-    np.random.seed(params.seed)
-    torch.manual_seed(params.seed)
+    envs.reset(seed=args.seed)
+    random.seed(args.seed)
+    np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
     torch.backends.cudnn.deterministic = True
 
     for _ in range(ppo.num_updates):
@@ -74,9 +75,9 @@ if __name__ == "__main__":
             writer.add_scalar("charts/episodic_return", returns, global_step + timestep)
             writer.add_scalar("charts/episodic_length", length, global_step + timestep)
 
-        rollout = collect_rollout(envs, ppo.actor, params.steps_per_rollout, log_episode_stats)
+        rollout = collect_rollout(envs, ppo.actor, args.steps_per_rollout, log_episode_stats)
 
-        global_step += params.steps_per_rollout
+        global_step += len(rollout)
 
         def log_training_stats(
             learning_rate: float,

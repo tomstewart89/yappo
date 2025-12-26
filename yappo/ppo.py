@@ -56,6 +56,7 @@ class ProximalPolicyOptimizer:
         num_epochs: int,
         total_timesteps: int,
         steps_per_rollout: int,
+        **_,
     ) -> None:
         self.gamma = gamma
         self.lamb = lamb

@@ -12,25 +12,24 @@ class Rollout:
         self.rewards = torch.zeros((num_steps, envs.num_envs))
         self.dones = torch.zeros((num_steps + 1, envs.num_envs))
 
+    def __len__(self) -> int:
+        return len(self.actions)
+
 
 def collect_rollout(
-    envs: gym.vector.SyncVectorEnv,
-    actor: Actor,
-    num_steps: int,
-    episode_cb: Optional[Callable] = None,
+    envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int, episode_cb: Optional[Callable] = None
 ) -> Rollout:
 
     rollout = Rollout(envs, num_steps)
     rollout.states[0] = torch.Tensor(envs._observations)
 
+    low, high = torch.Tensor(envs.action_space.low), torch.Tensor(envs.action_space.high)
+
     for t in range(num_steps):
         with torch.no_grad():
             dist = actor.get_action_distribution(rollout.states[t])
-            rollout.actions[t] = dist.sample()
+            rollout.actions[t] = torch.clip(dist.sample(), low, high)
             rollout.log_probs[t] = dist.log_prob(rollout.actions[t]).sum(1)
-
-        # TODO: clip actions here
-        # torch.clip(rollout.actions[t], torch.Tensor(envs.action_space.low), torch.Tensor(envs.action_space.high))
 
         state, reward, done, _, info = envs.step(rollout.actions[t].cpu().numpy())
 
