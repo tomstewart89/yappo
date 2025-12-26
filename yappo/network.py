@@ -5,14 +5,14 @@ import torch.nn as nn
 from torch.distributions.normal import Normal
 
 
-def layer_init(layer, std=np.sqrt(2), bias_const=0.0):
+def layer_init(layer: nn.Linear, std: float = 2**0.5, bias_const: float = 0.0) -> nn.Linear:
     torch.nn.init.orthogonal_(layer.weight, std)
     torch.nn.init.constant_(layer.bias, bias_const)
     return layer
 
 
 class Critic(nn.Module):
-    def __init__(self, env: gym.Env):
+    def __init__(self, env: gym.Env) -> None:
         super().__init__()
         self._critic = nn.Sequential(
             layer_init(nn.Linear(np.array(env.single_observation_space.shape).prod(), 64)),

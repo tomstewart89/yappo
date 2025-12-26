@@ -5,7 +5,7 @@ from yappo.network import Actor
 
 
 class Rollout:
-    def __init__(self, envs: gym.vector.SyncVectorEnv, num_steps: int):
+    def __init__(self, envs: gym.vector.SyncVectorEnv, num_steps: int) -> None:
         self.states = torch.zeros((num_steps + 1, envs.num_envs) + envs.single_observation_space.shape)
         self.actions = torch.zeros((num_steps, envs.num_envs) + envs.single_action_space.shape)
         self.log_probs = torch.zeros((num_steps, envs.num_envs))
@@ -14,10 +14,13 @@ class Rollout:
 
 
 def collect_rollout(
-    envs: gym.vector.SyncVectorEnv, actor: Actor, num_steps: int, episode_cb: Optional[Callable] = None
+    envs: gym.vector.SyncVectorEnv,
+    actor: Actor,
+    num_steps: int,
+    episode_cb: Optional[Callable] = None,
 ) -> Rollout:
-    rollout = Rollout(envs, num_steps)
 
+    rollout = Rollout(envs, num_steps)
     rollout.states[0] = torch.Tensor(envs.reset()[0])
 
     for t in range(num_steps):

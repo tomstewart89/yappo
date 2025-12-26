@@ -13,3 +13,11 @@ dependencies = [
 
 [tool.black]
 line-length = 120
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.10",
+]
+
+[tool.ruff.lint]
+extend-select = ["B", "ANN"]
